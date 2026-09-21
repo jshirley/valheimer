@@ -1,0 +1,264 @@
+#!/bin/bash
+#
+# valheim-sync — keep a macOS Valheim install in step with the group's
+# r2modman profile, and launch it with BepInEx actually attached.
+#
+#   ./valheim-sync setup      first run on a fresh machine
+#   ./valheim-sync sync       pull the latest modpack, repair the install
+#   ./valheim-sync play       preflight, then launch
+#
+set -u -o pipefail
+
+VS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+PROG="$(basename "$0")"
+
+OPT_GAME_DIR=""
+OPT_PROFILE_CODE=""
+OPT_FOREGROUND=0
+OPT_FOLLOW=0
+OPT_KEEP_CONFIG=0
+
+# shellcheck source=lib/common.sh
+. "$VS_ROOT/lib/common.sh"
+# shellcheck source=lib/profile.sh
+. "$VS_ROOT/lib/profile.sh"
+# shellcheck source=lib/packages.sh
+. "$VS_ROOT/lib/packages.sh"
+# shellcheck source=lib/bepinex.sh
+. "$VS_ROOT/lib/bepinex.sh"
+# shellcheck source=lib/preflight.sh
+. "$VS_ROOT/lib/preflight.sh"
+# shellcheck source=lib/launch.sh
+. "$VS_ROOT/lib/launch.sh"
+
+usage() {
+	cat <<EOF
+${C_BOLD}$PROG${C_RESET} — Valheim modpack sync and launcher for macOS
+
+${C_BOLD}COMMANDS${C_RESET}
+  setup            First run: Rosetta, BepInEx, signing, mods, launch options
+  sync             Fetch the shared profile, install/update/remove mods,
+                   re-apply the loader patches and the ad-hoc signature
+  preflight        Check everything and report; changes nothing
+  play             Preflight, then launch the game (alias: launch)
+  status           What the profile pins versus what is installed
+  logs             Show the BepInEx log (the only console macOS gives you)
+  steam-options    Print the string to paste into Steam's launch options
+  help             This text
+
+${C_BOLD}OPTIONS${C_RESET}
+  --profile CODE   Use a different r2modman profile code for this run
+  --game-dir PATH  Use a different Valheim folder for this run
+  --keep-config    sync: leave BepInEx/config alone, mods only
+  --foreground     play: run in this terminal instead of detaching
+  -f, --follow     logs: tail the log
+  -n, --dry-run    Show what would change, change nothing
+  -y, --yes        Answer yes to every prompt
+  -v, --verbose    Extra detail
+  -h, --help       This text
+
+${C_BOLD}CONFIG${C_RESET}
+  Shared settings  $(tilde "$VS_ROOT/config.conf")      (commit and share this)
+  Local overrides  $(tilde "$LOCAL_CONF")
+  State and cache  $(tilde "$STATE_DIR")
+EOF
+}
+
+# ------------------------------------------------------------------ commands --
+
+cmd_setup() {
+	info "Setting up Valheim modding on this Mac"
+
+	if ! is_apple_silicon; then
+		dbg "Intel Mac — Rosetta not required"
+	elif have_rosetta; then
+		ok "Rosetta 2 is installed"
+	else
+		warn "Rosetta 2 is not installed. BepInEx loads only under x86_64, so"
+		warn "the game has to run translated even on an Apple Silicon Mac."
+		if confirm "Install Rosetta 2 now?"; then
+			install_rosetta || die "Rosetta install failed"
+		else
+			die "Rosetta 2 is required. Install it with: softwareupdate --install-rosetta --agree-to-license"
+		fi
+	fi
+
+	[ -d "$APP" ] || die "valheim.app not found in $(tilde "$GAME_DIR") — install Valheim through Steam first"
+
+	cmd_sync || return $?
+
+	printf '\n'
+	info "Steam launch options (optional)"
+	say "  If you would rather start the game from your Steam library, paste"
+	say "  this into Valheim → Properties → Launch Options:"
+	printf '\n    %s%s%s\n\n' "$C_BOLD" "$(steam_launch_options)" "$C_RESET"
+	say "  Otherwise just run: $PROG play"
+	return 0
+}
+
+cmd_sync() {
+	local rc=0
+
+	info "Fetching profile $PROFILE_CODE"
+	fetch_profile || die "could not fetch the profile"
+	if [ "$PROFILE_FRESH" -eq 1 ]; then
+		ok "profile '$(profile_name)' updated"
+	else
+		ok "profile '$(profile_name)' unchanged since last sync"
+	fi
+
+	info "Checking the BepInEx loader"
+	ensure_loader || die "could not prepare the BepInEx loader"
+	ok "loader ready, valheim.app signed ad-hoc"
+
+	info "Syncing mods"
+	if sync_packages; then
+		ok "$SYNC_SUMMARY"
+	else
+		rc=1
+		bad "some mods failed to install — $SYNC_SUMMARY"
+	fi
+
+	if [ "$OPT_KEEP_CONFIG" -eq 1 ]; then
+		dbg "--keep-config: leaving BepInEx/config untouched"
+	else
+		info "Applying shared configuration"
+		local payload
+		payload="$(extract_profile_payload)" || die "could not unpack the profile"
+		if sync_profile_config "$payload"; then
+			if [ -n "${CONFIG_BACKUP:-}" ]; then
+				ok "config applied (previous config saved to $(tilde "$CONFIG_BACKUP"))"
+			else
+				ok "config applied"
+			fi
+		else
+			rc=1
+			bad "could not apply the shared configuration"
+		fi
+		rm -rf "$payload"
+	fi
+
+	return $rc
+}
+
+cmd_preflight() {
+	preflight
+}
+
+cmd_play() {
+	preflight
+	local rc=$?
+	if [ "$rc" -eq 2 ]; then
+		die "cannot launch until the problems above are sorted"
+	fi
+	if [ "$rc" -eq 1 ]; then
+		if confirm "Fix these and continue?"; then
+			cmd_sync || die "sync failed"
+		else
+			die "not launching with the install out of step"
+		fi
+	fi
+	ensure_steam
+	launch_game "$OPT_FOREGROUND"
+}
+
+cmd_status() {
+	have_profile || die "no profile cached yet — run: $PROG sync"
+
+	printf '\n%sProfile%s  %s  %s(%s, fetched %s)%s\n\n' \
+		"$C_BOLD" "$C_RESET" "$(profile_name)" \
+		"$C_DIM" "$PROFILE_CODE" "$(profile_age_human)" "$C_RESET"
+	printf '  %-38s %-12s %-12s %s\n' "MOD" "PINNED" "INSTALLED" "STATE"
+
+	local wanted full version have state
+	wanted="$(mktemp -t vsstatus)"
+	profile_enabled_mods > "$wanted"
+
+	while IFS=$'\t' read -r full version; do
+		[ -n "$full" ] || continue
+		if is_skipped "$full"; then
+			printf '  %-38s %-12s %-12s %sskipped (macOS loader)%s\n' \
+				"$full" "$version" "-" "$C_DIM" "$C_RESET"
+			continue
+		fi
+		have="$(installed_version "$full")"
+		if [ -z "$have" ]; then
+			state="${C_RED}missing${C_RESET}"; have="-"
+		elif [ "$have" != "$version" ]; then
+			state="${C_YELLOW}out of date${C_RESET}"
+		elif [ ! -d "$PLUGINS_DIR/$full" ]; then
+			state="${C_RED}files gone${C_RESET}"
+		else
+			state="${C_GREEN}ok${C_RESET}"
+		fi
+		printf '  %-38s %-12s %-12s %b\n' "$full" "$version" "$have" "$state"
+	done < "$wanted"
+
+	if [ -f "$INSTALLED_TSV" ]; then
+		while IFS=$'\t' read -r full version; do
+			[ -n "$full" ] || continue
+			awk -F'\t' -v n="$full" '$1 == n { f = 1 } END { exit !f }' "$wanted" && continue
+			printf '  %-38s %-12s %-12s %bnot in profile%b\n' \
+				"$full" "-" "$version" "$C_YELLOW" "$C_RESET"
+		done < "$INSTALLED_TSV"
+	fi
+	rm -f "$wanted"
+	printf '\n'
+}
+
+cmd_steam_options() {
+	steam_launch_options
+}
+
+cmd_logs() {
+	show_logs "$OPT_FOLLOW"
+}
+
+# -------------------------------------------------------------------- main --
+
+main() {
+	local cmd=""
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-h|--help)      cmd="help"; shift;;
+			-n|--dry-run)   OPT_DRY_RUN=1; shift;;
+			-y|--yes)       OPT_YES=1; shift;;
+			-v|--verbose)   OPT_VERBOSE=1; shift;;
+			-f|--follow)    OPT_FOLLOW=1; shift;;
+			--foreground)   OPT_FOREGROUND=1; shift;;
+			--keep-config)  OPT_KEEP_CONFIG=1; shift;;
+			--profile)      OPT_PROFILE_CODE="${2:-}"; shift 2 || die "--profile needs a code";;
+			--game-dir)     OPT_GAME_DIR="${2:-}"; shift 2 || die "--game-dir needs a path";;
+			--profile=*)    OPT_PROFILE_CODE="${1#*=}"; shift;;
+			--game-dir=*)   OPT_GAME_DIR="${1#*=}"; shift;;
+			-*)             die "unknown option: $1 (try: $PROG help)";;
+			*)              [ -z "$cmd" ] || die "unexpected argument: $1 (try: $PROG help)"
+			                cmd="$1"; shift;;
+		esac
+	done
+
+	case "${cmd:-help}" in
+		help|"")            usage; return 0;;
+	esac
+
+	case "$(uname -s)" in
+		Darwin) ;;
+		*) die "this tool is macOS-only ($(uname -s) detected)";;
+	esac
+
+	load_config
+
+	case "$cmd" in
+		setup)                    cmd_setup;;
+		sync|update)              cmd_sync;;
+		preflight|check|doctor)   cmd_preflight;;
+		play|launch|start)        cmd_play;;
+		status)                   cmd_status;;
+		logs|log)                 cmd_logs;;
+		steam-options|steam)      cmd_steam_options;;
+		*) die "unknown command: $cmd (try: $PROG help)";;
+	esac
+}
+
+main "$@"
