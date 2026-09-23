@@ -24,11 +24,14 @@ practice it is the only command you need.
 | `preflight` | Check all of the above and report. Changes nothing |
 | `play` | Preflight, then launch and confirm the chainloader came up |
 | `status` | What the profile pins versus what is installed |
+| `add MOD...` | Add a mod and its dependencies, no r2modman needed |
+| `drop MOD...` | Remove a mod |
+| `publish` | Upload the current mod list and get a code to share |
 | `logs` | The BepInEx log — BepInEx 5 has no console on macOS |
 | `steam-options` | The string to paste into Steam's launch options |
 
 Useful flags: `-n/--dry-run`, `-y/--yes`, `-v/--verbose`, `--keep-config`,
-`--foreground`, `--profile CODE`, `--game-dir PATH`.
+`--foreground`, `--profile CODE`, `--game-dir PATH`, `--name`, `--no-config`.
 
 ## Updating the modpack
 
@@ -39,6 +42,46 @@ the new code in `config.conf`, commit, and tell everyone to run
 `config.conf` is the shared file. Anything machine-specific — a Valheim install
 on another drive, say — goes in `~/.config/valheim-sync/local.conf` with the
 same syntax, so nobody has to keep a local edit out of the repo.
+
+## Changing the modpack from a Mac
+
+You do not need r2modman, or a Windows machine, to change the mod list and hand
+the group a new code:
+
+```sh
+./valheim-sync add Advize-PlantEasily        # latest version
+./valheim-sync add RustyMods-Almanac@3.7.94  # a specific version
+./valheim-sync drop TenebrisReverie-ResourceBoost
+./valheim-sync publish                       # -> a code anyone can import
+```
+
+A mod can be named as `Namespace-ModName`, `Namespace-ModName-1.2.3`,
+`Namespace-ModName@1.2.3`, or a thunderstore.io package URL. Dependencies are
+resolved recursively from Thunderstore's API and pulled in automatically.
+
+`add` and `drop` record what you changed in a **local overlay** on top of the
+shared profile, so a later `sync` will not undo your changes — it merges the
+profile with your overlay. `status` labels each mod `profile` or `local`, and
+preflight reminds you when you have local changes nobody else has:
+
+```
+! local changes         1 not in the shared profile — run: valheim-sync publish
+```
+
+`publish` builds the same export format r2modman produces — the full mod list
+(including the Windows BepInEx pack, so Windows players who import the code
+still get a loader) plus your `BepInEx/config` — uploads it to Thunderstore, and
+prints the new code. Use `--no-config` to publish the mod list alone, and
+`--name` to rename the profile.
+
+Because the returned code is what everyone else pins, `publish` then offers to
+write it into `config.conf` and fold your overlay in, leaving you with nothing
+local and a one-line commit to push. On Windows, your friends import it with
+r2modman → Import/Update → Import from code; on a Mac, they just pull and run
+`./valheim-sync sync`.
+
+A published code is public to anyone who has it, so `publish` always asks before
+uploading.
 
 ## What preflight actually checks
 
@@ -84,6 +127,7 @@ always win.
 | Shared config | `config.conf` in this repo |
 | Local overrides | `~/.config/valheim-sync/local.conf` |
 | State | `~/Library/Application Support/valheim-sync` |
+| Local overlay | `<state>/overlay.tsv`, `<state>/dropped.txt` |
 | Download cache | `~/Library/Caches/valheim-sync` |
 | BepInEx log | `<game>/BepInEx/LogOutput.log` |
 | Preloader crash log | `<game>/valheim.app/Contents/MacOS/preloader_*.log` |

@@ -14,9 +14,12 @@ PROG="$(basename "$0")"
 
 OPT_GAME_DIR=""
 OPT_PROFILE_CODE=""
+OPT_PROFILE_NAME=""
 OPT_FOREGROUND=0
 OPT_FOLLOW=0
 OPT_KEEP_CONFIG=0
+OPT_NO_CONFIG=0
+CMD_ARGS=()
 
 # shellcheck source=lib/common.sh
 . "$VS_ROOT/lib/common.sh"
@@ -26,6 +29,8 @@ OPT_KEEP_CONFIG=0
 . "$VS_ROOT/lib/packages.sh"
 # shellcheck source=lib/bepinex.sh
 . "$VS_ROOT/lib/bepinex.sh"
+# shellcheck source=lib/thunderstore.sh
+. "$VS_ROOT/lib/thunderstore.sh"
 # shellcheck source=lib/preflight.sh
 . "$VS_ROOT/lib/preflight.sh"
 # shellcheck source=lib/launch.sh
@@ -42,13 +47,22 @@ ${C_BOLD}COMMANDS${C_RESET}
   preflight        Check everything and report; changes nothing
   play             Preflight, then launch the game (alias: launch)
   status           What the profile pins versus what is installed
+  add MOD...       Add a mod (with its dependencies) without r2modman
+  drop MOD...      Remove a mod
+  publish          Upload the current mod list and get a code to share
   logs             Show the BepInEx log (the only console macOS gives you)
   steam-options    Print the string to paste into Steam's launch options
   help             This text
 
+${C_BOLD}MOD NAMES${C_RESET}
+  Namespace-ModName, Namespace-ModName-1.2.3, Namespace-ModName@1.2.3,
+  or a thunderstore.io package URL. Without a version you get the latest.
+
 ${C_BOLD}OPTIONS${C_RESET}
   --profile CODE   Use a different r2modman profile code for this run
   --game-dir PATH  Use a different Valheim folder for this run
+  --name NAME      publish: name the profile (default: the current one)
+  --no-config      publish: mod list only, leave your config out
   --keep-config    sync: leave BepInEx/config alone, mods only
   --foreground     play: run in this terminal instead of detaching
   -f, --follow     logs: tail the log
@@ -168,19 +182,24 @@ cmd_status() {
 	printf '\n%sProfile%s  %s  %s(%s, fetched %s)%s\n\n' \
 		"$C_BOLD" "$C_RESET" "$(profile_name)" \
 		"$C_DIM" "$PROFILE_CODE" "$(profile_age_human)" "$C_RESET"
-	printf '  %-38s %-12s %-12s %s\n' "MOD" "PINNED" "INSTALLED" "STATE"
+	printf "  %-38s %-10s %-10s %-8s %s\n" "MOD" "PINNED" "INSTALLED" "FROM" "STATE"
 
-	local wanted full version have state
+	local wanted full version origin have state
 	wanted="$(mktemp -t vsstatus)"
-	profile_enabled_mods > "$wanted"
+	desired_mods > "$wanted"
 
-	while IFS=$'\t' read -r full version; do
+	# The loader packages are in the profile but never installed here.
+	profile_enabled_mods | while IFS=$'\t' read -r full version; do
 		[ -n "$full" ] || continue
 		if is_skipped "$full"; then
-			printf '  %-38s %-12s %-12s %sskipped (macOS loader)%s\n' \
-				"$full" "$version" "-" "$C_DIM" "$C_RESET"
-			continue
+			printf '  %-38s %-10s %-10s %-8s %sskipped (macOS loader)%s\n' \
+				"$full" "$version" "-" "profile" "$C_DIM" "$C_RESET"
 		fi
+	done
+
+	while IFS=$'\t' read -r full version origin; do
+		[ -n "$full" ] || continue
+		is_skipped "$full" && continue
 		have="$(installed_version "$full")"
 		if [ -z "$have" ]; then
 			state="${C_RED}missing${C_RESET}"; have="-"
@@ -191,19 +210,196 @@ cmd_status() {
 		else
 			state="${C_GREEN}ok${C_RESET}"
 		fi
-		printf '  %-38s %-12s %-12s %b\n' "$full" "$version" "$have" "$state"
+		printf '  %-38s %-10s %-10s %-8s %b\n' "$full" "$version" "$have" "$origin" "$state"
 	done < "$wanted"
 
 	if [ -f "$INSTALLED_TSV" ]; then
 		while IFS=$'\t' read -r full version; do
 			[ -n "$full" ] || continue
 			awk -F'\t' -v n="$full" '$1 == n { f = 1 } END { exit !f }' "$wanted" && continue
-			printf '  %-38s %-12s %-12s %bnot in profile%b\n' \
-				"$full" "-" "$version" "$C_YELLOW" "$C_RESET"
+			printf '  %-38s %-10s %-10s %-8s %bnot wanted%b\n' \
+				"$full" "-" "$version" "-" "$C_YELLOW" "$C_RESET"
 		done < "$INSTALLED_TSV"
 	fi
 	rm -f "$wanted"
+
+	local dropped
+	if [ -f "$DROPPED_TXT" ] && [ -s "$DROPPED_TXT" ]; then
+		printf '\n  %sdropped locally:%s ' "$C_DIM" "$C_RESET"
+		dropped="$(tr '\n' ' ' < "$DROPPED_TXT")"
+		printf '%s\n' "$dropped"
+	fi
 	printf '\n'
+}
+
+cmd_add() {
+	[ "$#" -gt 0 ] || die "add needs a mod — e.g. $PROG add RustyMods-Seasonality"
+	have_profile || fetch_profile || die "could not fetch the profile"
+
+	local spec resolved full version have added=0
+	resolved="$(mktemp -t vsadd)"
+
+	for spec in "$@"; do
+		info "Resolving $spec"
+		ts_resolve "$spec" >> "$resolved" || { rm -f "$resolved"; exit 2; }
+	done
+
+	while IFS=$'\t' read -r full version; do
+		[ -n "$full" ] || continue
+		if is_skipped "$full"; then
+			dbg "$full is the Windows loader — skipped on macOS"
+			continue
+		fi
+		have="$(desired_version "$full")"
+		# overlay_set runs either way: when the version already matches it is
+		# what clears a now-pointless overlay entry or an earlier drop.
+		overlay_set "$full" "$version"
+		if [ "$have" = "$version" ]; then
+			ok "$full $version already in the list"
+			continue
+		fi
+		if [ -n "$have" ]; then
+			ok "$full ${have} -> ${version}"
+		else
+			ok "$full ${version}"
+		fi
+		added=$((added + 1))
+	done < "$resolved"
+	rm -f "$resolved"
+
+	if [ "$added" -eq 0 ]; then
+		say "  Nothing to change."
+		return 0
+	fi
+
+	info "Installing"
+	ensure_loader || die "could not prepare the BepInEx loader"
+	if sync_packages; then
+		ok "$SYNC_SUMMARY"
+	else
+		bad "some mods failed to install — $SYNC_SUMMARY"
+		return 1
+	fi
+
+	printf '\n'
+	say "  Added locally. To hand the group a code with this in it:"
+	say "    $PROG publish"
+	return 0
+}
+
+cmd_drop() {
+	[ "$#" -gt 0 ] || die "drop needs a mod — e.g. $PROG drop TenebrisReverie-ResourceBoost"
+	have_profile || fetch_profile || die "could not fetch the profile"
+
+	local spec ns name full dropped=0
+	for spec in "$@"; do
+		IFS=$'\t' read -r ns name _ <<EOF
+$(parse_spec "$spec" || true)
+EOF
+		if [ -z "${ns:-}" ] || [ -z "${name:-}" ]; then
+			bad "cannot make sense of '$spec' — expected Namespace-ModName"
+			continue
+		fi
+		full="$ns-$name"
+		if [ -z "$(desired_version "$full")" ]; then
+			warn "$full is not in the list"
+			continue
+		fi
+		overlay_unset "$full"
+		# A drop marker only earns its keep for something the shared profile
+		# pins; a purely local mod just leaves the overlay.
+		if profile_enabled_mods | awk -F'\t' -v n="$full" '$1 == n { f = 1 } END { exit !f }'; then
+			mark_dropped "$full"
+		fi
+		remove_package "$full"
+		ok "removed $full"
+		dropped=$((dropped + 1))
+	done
+
+	[ "$dropped" -eq 0 ] && return 0
+	printf '\n'
+	say "  Removed locally. To hand the group a code without it:"
+	say "    $PROG publish"
+	return 0
+}
+
+cmd_publish() {
+	have_profile || fetch_profile || die "could not fetch the profile"
+
+	local name="${OPT_PROFILE_NAME:-$(profile_name)}"
+	[ -n "$name" ] || name="valheim-sync"
+
+	local with_config=1
+	[ "$OPT_NO_CONFIG" -eq 1 ] && with_config=0
+
+	printf '\n%sPublishing profile%s %s\n\n' "$C_BOLD" "$C_RESET" "$name"
+	publish_entries | while IFS=$'\t' read -r full version; do
+		printf '    %-40s %s\n' "$full" "$version"
+	done
+	local n; n="$(publish_entries | grep -c . || true)"
+	printf '\n  %s mod(s)' "$n"
+	[ "$with_config" -eq 1 ] && printf ', plus your BepInEx config'
+	printf '\n\n'
+
+	say "  This uploads the list above to Thunderstore and returns a code that"
+	say "  anyone can import. The code is public to anyone who has it."
+	printf '\n'
+	confirm "Upload it?" || { say "  Cancelled."; return 0; }
+
+	local zip; zip="$(mktemp -t vspubzip)"
+	build_profile_payload "$name" "$zip" "$with_config" || { rm -f "$zip"; return 1; }
+	dbg "payload $(du -h "$zip" | awk '{print $1}')"
+
+	if [ "$OPT_DRY_RUN" -eq 1 ]; then
+		printf '  %s[dry-run]%s would upload %s\n' "$C_DIM" "$C_RESET" "$zip"
+		rm -f "$zip"
+		return 0
+	fi
+
+	info "Uploading"
+	local key
+	key="$(upload_profile "$zip")" || { rm -f "$zip"; return 1; }
+	rm -f "$zip"
+
+	printf '\n  %sNew profile code%s\n\n    %s%s%s\n\n' \
+		"$C_BOLD" "$C_RESET" "$C_BOLD" "$key" "$C_RESET"
+	say "  Share that with the group. On Windows: r2modman -> Import/Update"
+	say "  -> Import from code."
+	printf '\n'
+
+	if confirm "Make this the shared code in config.conf?"; then
+		adopt_profile_code "$key" || return 1
+		# Refresh the cached profile before dropping the overlay, or the old
+		# cache would silently undo the changes until the next sync.
+		PROFILE_CODE="$key"
+		if fetch_profile; then
+			overlay_clear
+			ok "config.conf now pins $key; local changes folded in"
+			say "  Commit config.conf so everyone else picks it up."
+		else
+			warn "config.conf now pins $key, but it could not be fetched yet; local changes kept"
+			say "  Run: $PROG sync  (then the overlay can go once the code resolves)"
+		fi
+	else
+		say "  config.conf still pins the old code; your local changes stay local."
+	fi
+	return 0
+}
+
+# adopt_profile_code CODE — rewrite PROFILE_CODE in the shared config file.
+adopt_profile_code() {
+	local code="$1" tmp
+	tmp="$(mktemp -t vscfg)"
+	sed "s|^PROFILE_CODE=.*|PROFILE_CODE=\"$code\"|" "$VS_ROOT/config.conf" > "$tmp" || {
+		rm -f "$tmp"; bad "could not update config.conf"; return 1
+	}
+	if ! grep -q "^PROFILE_CODE=\"$code\"" "$tmp"; then
+		rm -f "$tmp"; bad "could not find PROFILE_CODE in config.conf"; return 1
+	fi
+	mv "$tmp" "$VS_ROOT/config.conf"
+	# The cached profile is now the wrong one for this code.
+	rm -f "$PROFILE_ETAG"
+	return 0
 }
 
 cmd_steam_options() {
@@ -228,13 +424,15 @@ main() {
 			-f|--follow)    OPT_FOLLOW=1; shift;;
 			--foreground)   OPT_FOREGROUND=1; shift;;
 			--keep-config)  OPT_KEEP_CONFIG=1; shift;;
+			--no-config)    OPT_NO_CONFIG=1; shift;;
 			--profile)      OPT_PROFILE_CODE="${2:-}"; shift 2 || die "--profile needs a code";;
 			--game-dir)     OPT_GAME_DIR="${2:-}"; shift 2 || die "--game-dir needs a path";;
+			--name)         OPT_PROFILE_NAME="${2:-}"; shift 2 || die "--name needs a value";;
 			--profile=*)    OPT_PROFILE_CODE="${1#*=}"; shift;;
 			--game-dir=*)   OPT_GAME_DIR="${1#*=}"; shift;;
+			--name=*)       OPT_PROFILE_NAME="${1#*=}"; shift;;
 			-*)             die "unknown option: $1 (try: $PROG help)";;
-			*)              [ -z "$cmd" ] || die "unexpected argument: $1 (try: $PROG help)"
-			                cmd="$1"; shift;;
+			*)              if [ -z "$cmd" ]; then cmd="$1"; else CMD_ARGS+=("$1"); fi; shift;;
 		esac
 	done
 
@@ -249,12 +447,21 @@ main() {
 
 	load_config
 
+	# Only add/drop take positional arguments.
+	case "$cmd" in
+		add|drop|remove) ;;
+		*) [ "${#CMD_ARGS[@]}" -eq 0 ] || die "$cmd takes no arguments (try: $PROG help)";;
+	esac
+
 	case "$cmd" in
 		setup)                    cmd_setup;;
 		sync|update)              cmd_sync;;
 		preflight|check|doctor)   cmd_preflight;;
 		play|launch|start)        cmd_play;;
 		status)                   cmd_status;;
+		add)                      cmd_add "${CMD_ARGS[@]+"${CMD_ARGS[@]}"}";;
+		drop|remove)              cmd_drop "${CMD_ARGS[@]+"${CMD_ARGS[@]}"}";;
+		publish|share)            cmd_publish;;
 		logs|log)                 cmd_logs;;
 		steam-options|steam)      cmd_steam_options;;
 		*) die "unknown command: $cmd (try: $PROG help)";;

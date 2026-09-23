@@ -124,9 +124,110 @@ profile_mods() {
 	' "$PROFILE_R2X"
 }
 
-# profile_enabled_mods — the mods we are actually meant to install.
+# profile_enabled_mods — the mods the shared profile itself pins.
 profile_enabled_mods() {
 	profile_mods | awk -F'\t' '$3 == "true" { print $1 "\t" $2 }'
+}
+
+# ----------------------------------------------------------- local overlay ----
+#
+# `add` and `drop` let you change the mod list without r2modman, which means
+# the shared profile is no longer the whole story. The overlay records what you
+# changed locally; desired_mods is the profile with those changes layered on,
+# and it — not the profile — is what sync installs and publish exports.
+
+is_dropped() { [ -f "$DROPPED_TXT" ] && grep -qxF "$1" "$DROPPED_TXT" 2>/dev/null; }
+
+in_overlay() {
+	[ -f "$OVERLAY_TSV" ] || return 1
+	awk -F'\t' -v n="$1" '$1 == n { f = 1 } END { exit !f }' "$OVERLAY_TSV"
+}
+
+overlay_set() {
+	[ "$OPT_DRY_RUN" -eq 1 ] && return 0
+
+	# Adding something back cancels an earlier drop.
+	if [ -f "$DROPPED_TXT" ]; then
+		local d; d="$(mktemp -t vsdr)"
+		grep -vxF "$1" "$DROPPED_TXT" > "$d" 2>/dev/null
+		mv "$d" "$DROPPED_TXT"
+	fi
+
+	# If the shared profile already pins this exact version there is nothing
+	# local about it, and recording one would nag about unpublished changes.
+	local pinned
+	pinned="$(profile_enabled_mods | awk -F'\t' -v n="$1" '$1 == n { print $2; exit }')"
+	if [ "$pinned" = "$2" ]; then
+		overlay_unset "$1"
+		return 0
+	fi
+
+	local tmp; tmp="$(mktemp -t vsov)"
+	[ -f "$OVERLAY_TSV" ] && awk -F'\t' -v n="$1" '$1 != n' "$OVERLAY_TSV" > "$tmp"
+	printf '%s\t%s\n' "$1" "$2" >> "$tmp"
+	sort -o "$tmp" "$tmp"
+	mv "$tmp" "$OVERLAY_TSV"
+}
+
+overlay_unset() {
+	[ "$OPT_DRY_RUN" -eq 1 ] && return 0
+	[ -f "$OVERLAY_TSV" ] || return 0
+	local tmp; tmp="$(mktemp -t vsov)"
+	awk -F'\t' -v n="$1" '$1 != n' "$OVERLAY_TSV" > "$tmp"
+	mv "$tmp" "$OVERLAY_TSV"
+}
+
+mark_dropped() {
+	[ "$OPT_DRY_RUN" -eq 1 ] && return 0
+	is_dropped "$1" && return 0
+	printf '%s\n' "$1" >> "$DROPPED_TXT"
+}
+
+overlay_clear() {
+	[ "$OPT_DRY_RUN" -eq 1 ] && return 0
+	rm -f "$OVERLAY_TSV" "$DROPPED_TXT"
+}
+
+# overlay_count — how many local changes are not in the shared profile.
+# Counted with awk, not `grep -c`: grep exits 1 on zero matches, so the usual
+# `grep -c ... || echo 0` prints "0" twice and poisons the arithmetic.
+overlay_count() {
+	local n=0 c f
+	for f in "$OVERLAY_TSV" "$DROPPED_TXT"; do
+		[ -f "$f" ] || continue
+		c="$(awk 'NF' "$f" 2>/dev/null | wc -l | tr -d ' ')"
+		n=$(( n + ${c:-0} ))
+	done
+	printf '%s\n' "$n"
+}
+
+# desired_mods — "full_name<TAB>version<TAB>origin" for everything that should
+# be installed, where origin is "profile" or "local".
+desired_mods() {
+	local out full version
+	out="$(mktemp -t vsdes)"
+	if have_profile; then
+		profile_enabled_mods | while IFS=$'\t' read -r full version; do
+			[ -n "$full" ] || continue
+			is_dropped "$full" && continue
+			in_overlay "$full" && continue
+			printf '%s\t%s\tprofile\n' "$full" "$version"
+		done >> "$out"
+	fi
+	if [ -f "$OVERLAY_TSV" ]; then
+		while IFS=$'\t' read -r full version; do
+			[ -n "$full" ] || continue
+			is_dropped "$full" && continue
+			printf '%s\t%s\tlocal\n' "$full" "$version"
+		done < "$OVERLAY_TSV" >> "$out"
+	fi
+	sort -u "$out"
+	rm -f "$out"
+}
+
+# desired_version FULL_NAME — the version we want installed, empty if not wanted.
+desired_version() {
+	desired_mods | awk -F'\t' -v n="$1" '$1 == n { print $2; exit }'
 }
 
 # extract_profile_configs DEST_TMP — unpack the profile's config payload.
