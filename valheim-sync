@@ -19,6 +19,7 @@ OPT_FOREGROUND=0
 OPT_FOLLOW=0
 OPT_KEEP_CONFIG=0
 OPT_NO_CONFIG=0
+OPT_SERVER_DIR=""
 CMD_ARGS=()
 
 # shellcheck source=lib/common.sh
@@ -31,6 +32,8 @@ CMD_ARGS=()
 . "$VS_ROOT/lib/bepinex.sh"
 # shellcheck source=lib/thunderstore.sh
 . "$VS_ROOT/lib/thunderstore.sh"
+# shellcheck source=lib/server.sh
+. "$VS_ROOT/lib/server.sh"
 # shellcheck source=lib/preflight.sh
 . "$VS_ROOT/lib/preflight.sh"
 # shellcheck source=lib/launch.sh
@@ -50,6 +53,8 @@ ${C_BOLD}COMMANDS${C_RESET}
   add MOD...       Add a mod (with its dependencies) without r2modman
   drop MOD...      Remove a mod
   publish          Upload the current mod list and get a code to share
+  server [CMD]     The game server over FTP: add (login), status, sync, tree,
+                   forget. Compares its mods with yours and syncs either way
   logs             Show the BepInEx log (the only console macOS gives you)
   steam-options    Print the string to paste into Steam's launch options
   help             This text
@@ -63,6 +68,8 @@ ${C_BOLD}OPTIONS${C_RESET}
   --game-dir PATH  Use a different Valheim folder for this run
   --name NAME      publish: name the profile (default: the current one)
   --no-config      publish: mod list only, leave your config out
+  --to-server      server sync: local wins, no questions asked
+  --from-server    server sync: the server wins, no questions asked
   --keep-config    sync: leave BepInEx/config alone, mods only
   --foreground     play: run in this terminal instead of detaching
   -f, --follow     logs: tail the log
@@ -305,13 +312,7 @@ EOF
 			warn "$full is not in the list"
 			continue
 		fi
-		overlay_unset "$full"
-		# A drop marker only earns its keep for something the shared profile
-		# pins; a purely local mod just leaves the overlay.
-		if profile_enabled_mods | awk -F'\t' -v n="$full" '$1 == n { f = 1 } END { exit !f }'; then
-			mark_dropped "$full"
-		fi
-		remove_package "$full"
+		drop_local "$full"
 		ok "removed $full"
 		dropped=$((dropped + 1))
 	done
@@ -425,6 +426,8 @@ main() {
 			--foreground)   OPT_FOREGROUND=1; shift;;
 			--keep-config)  OPT_KEEP_CONFIG=1; shift;;
 			--no-config)    OPT_NO_CONFIG=1; shift;;
+			--to-server)    OPT_SERVER_DIR=to; shift;;
+			--from-server)  OPT_SERVER_DIR=from; shift;;
 			--profile)      OPT_PROFILE_CODE="${2:-}"; shift 2 || die "--profile needs a code";;
 			--game-dir)     OPT_GAME_DIR="${2:-}"; shift 2 || die "--game-dir needs a path";;
 			--name)         OPT_PROFILE_NAME="${2:-}"; shift 2 || die "--name needs a value";;
@@ -449,7 +452,7 @@ main() {
 
 	# Only add/drop take positional arguments.
 	case "$cmd" in
-		add|drop|remove) ;;
+		add|drop|remove|server|ftp) ;;
 		*) [ "${#CMD_ARGS[@]}" -eq 0 ] || die "$cmd takes no arguments (try: $PROG help)";;
 	esac
 
@@ -462,6 +465,7 @@ main() {
 		add)                      cmd_add "${CMD_ARGS[@]+"${CMD_ARGS[@]}"}";;
 		drop|remove)              cmd_drop "${CMD_ARGS[@]+"${CMD_ARGS[@]}"}";;
 		publish|share)            cmd_publish;;
+		server|ftp)               cmd_server "${CMD_ARGS[@]+"${CMD_ARGS[@]}"}";;
 		logs|log)                 cmd_logs;;
 		steam-options|steam)      cmd_steam_options;;
 		*) die "unknown command: $cmd (try: $PROG help)";;

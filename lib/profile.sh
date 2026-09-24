@@ -201,6 +201,17 @@ overlay_count() {
 	printf '%s\n' "$n"
 }
 
+# drop_local FULL_NAME — take a mod out of the local list and off this Mac.
+# A drop marker is only needed for something the shared profile pins; a purely
+# local mod just leaves the overlay.
+drop_local() {
+	overlay_unset "$1"
+	if profile_enabled_mods | awk -F'\t' -v n="$1" '$1 == n { f = 1 } END { exit !f }'; then
+		mark_dropped "$1"
+	fi
+	remove_package "$1"
+}
+
 # desired_mods — "full_name<TAB>version<TAB>origin" for everything that should
 # be installed, where origin is "profile" or "local".
 desired_mods() {
