@@ -22,7 +22,7 @@ pf_hint()  { PF_HINTS="$PF_HINTS$1"$'\n'; }
 
 pfc_tools() {
 	local missing="" t
-	for t in curl unzip codesign shasum sed awk ditto xattr; do
+	for t in curl unzip zip codesign shasum sed awk ditto xattr plutil; do
 		command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
 	done
 	if [ -n "$missing" ]; then
@@ -155,7 +155,7 @@ pfc_mods() {
 	have_profile || return 0
 	local wanted have full version n_want=0 n_bad=0 detail=""
 	wanted="$(mktemp -t vspfmods)"
-	profile_enabled_mods > "$wanted"
+	desired_mods | cut -f1,2 > "$wanted"
 
 	while IFS=$'\t' read -r full version; do
 		[ -n "$full" ] || continue
@@ -181,11 +181,18 @@ pfc_mods() {
 	fi
 	rm -f "$wanted"
 
+	local overlay; overlay="$(overlay_count)"
+	local scope="the profile"
+	[ "$overlay" -gt 0 ] && scope="the profile + $overlay local change(s)"
+
 	if [ "$n_bad" -eq 0 ]; then
-		pf_ok "mods" "$n_want in step with the profile"
+		pf_ok "mods" "$n_want in step with $scope"
 	else
 		pf_fix "mods" "$n_bad of $n_want out of step"
 		pf_hint "Out of step: $detail"
+	fi
+	if [ "$overlay" -gt 0 ]; then
+		pf_warn "local changes" "$overlay not in the shared profile — run: $(basename "$0") publish"
 	fi
 }
 

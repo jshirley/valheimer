@@ -80,6 +80,8 @@ load_config() {
 	BEPINEX_LOG="$BEPINEX_DIR/LogOutput.log"
 
 	INSTALLED_TSV="$STATE_DIR/installed.tsv"
+	OVERLAY_TSV="$STATE_DIR/overlay.tsv"
+	DROPPED_TXT="$STATE_DIR/dropped.txt"
 	PROFILE_ZIP="$STATE_DIR/profile.zip"
 	PROFILE_R2X="$STATE_DIR/profile.r2x"
 	PROFILE_ETAG="$STATE_DIR/profile.etag"
@@ -115,7 +117,7 @@ prune_backups() {
 	local keep="$1" dir="$STATE_DIR/backups" old
 	[ -d "$dir" ] || return 0
 	ls -1 "$dir" 2>/dev/null | sort -r | tail -n "+$((keep + 1))" | while IFS= read -r old; do
-		[ -n "$old" ] && rm -rf "$dir/$old"
+		[ -n "$old" ] && rm -rf "${dir:?}/${old:?}"
 	done
 }
 

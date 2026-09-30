@@ -118,9 +118,9 @@ remove_package() {
 # sync_packages — bring BepInEx/plugins in line with the profile manifest.
 # Echoes a short summary; returns 1 if anything failed.
 sync_packages() {
-	local wanted failed=0 line full version have zip
+	local wanted failed=0 full version have zip
 	wanted="$(mktemp -t vswanted)"
-	profile_enabled_mods > "$wanted"
+	desired_mods | cut -f1,2 > "$wanted"
 
 	local n_add=0 n_upd=0 n_fix=0 n_same=0 n_del=0 n_skip=0
 

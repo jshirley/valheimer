@@ -24,11 +24,16 @@ practice it is the only command you need.
 | `preflight` | Check all of the above and report. Changes nothing |
 | `play` | Preflight, then launch and confirm the chainloader came up |
 | `status` | What the profile pins versus what is installed |
+| `add MOD...` | Add a mod and its dependencies, no r2modman needed |
+| `drop MOD...` | Remove a mod |
+| `publish` | Upload the current mod list and get a code to share |
+| `server [add\|status\|sync\|tree\|forget]` | Inspect and sync the dedicated server over FTP |
 | `logs` | The BepInEx log — BepInEx 5 has no console on macOS |
 | `steam-options` | The string to paste into Steam's launch options |
 
 Useful flags: `-n/--dry-run`, `-y/--yes`, `-v/--verbose`, `--keep-config`,
-`--foreground`, `--profile CODE`, `--game-dir PATH`.
+`--foreground`, `--profile CODE`, `--game-dir PATH`, `--name`, `--no-config`,
+`--to-server`, `--from-server`.
 
 ## Updating the modpack
 
@@ -39,6 +44,84 @@ the new code in `config.conf`, commit, and tell everyone to run
 `config.conf` is the shared file. Anything machine-specific — a Valheim install
 on another drive, say — goes in `~/.config/valheim-sync/local.conf` with the
 same syntax, so nobody has to keep a local edit out of the repo.
+
+## Changing the modpack from a Mac
+
+You do not need r2modman, or a Windows machine, to change the mod list and hand
+the group a new code:
+
+```sh
+./valheim-sync add Advize-PlantEasily        # latest version
+./valheim-sync add RustyMods-Almanac@3.7.94  # a specific version
+./valheim-sync drop TenebrisReverie-ResourceBoost
+./valheim-sync publish                       # -> a code anyone can import
+```
+
+A mod can be named as `Namespace-ModName`, `Namespace-ModName-1.2.3`,
+`Namespace-ModName@1.2.3`, or a thunderstore.io package URL. Dependencies are
+resolved recursively from Thunderstore's API and pulled in automatically.
+
+`add` and `drop` record what you changed in a **local overlay** on top of the
+shared profile, so a later `sync` will not undo your changes — it merges the
+profile with your overlay. `status` labels each mod `profile` or `local`, and
+preflight reminds you when you have local changes nobody else has:
+
+```
+! local changes         1 not in the shared profile — run: valheim-sync publish
+```
+
+`publish` builds the same export format r2modman produces — the full mod list
+(including the Windows BepInEx pack, so Windows players who import the code
+still get a loader) plus your `BepInEx/config` — uploads it to Thunderstore, and
+prints the new code. Use `--no-config` to publish the mod list alone, and
+`--name` to rename the profile.
+
+Because the returned code is what everyone else pins, `publish` then offers to
+write it into `config.conf` and fold your overlay in, leaving you with nothing
+local and a one-line commit to push. On Windows, your friends import it with
+r2modman → Import/Update → Import from code; on a Mac, they just pull and run
+`./valheim-sync sync`.
+
+A published code is public to anyone who has it, so `publish` always asks before
+uploading.
+
+## Checking the game server over FTP
+
+Hosts like Host Havoc give you the server's files over FTP. Tell valheim-sync
+the login once, and it can compare the server's mods with yours:
+
+```sh
+./valheim-sync server add      # host, port, user, password -> Keychain
+./valheim-sync server status   # every mod: local version vs server version
+./valheim-sync server sync     # fix differences, asking which way each time
+./valheim-sync server tree     # browse the server's directory tree
+```
+
+The password goes in your macOS Keychain; the host, user and path go in
+`~/.config/valheim-sync/server.conf` (mode 600, outside the repo). `server
+forget` removes both.
+
+`status` reads `BepInEx/plugins` on the server and lists each mod as `ok`,
+`version differs`, `not on server`, `only on server` or `server version
+unknown`. Versions come from the `manifest.json` inside each
+`Namespace-ModName` folder, which is what r2modman and this tool both leave
+there. A folder without one (or with a hand-made name) can be seen but not
+version-checked; loose DLLs are listed and never touched.
+
+`server sync` asks about every difference:
+
+| Difference | `l` local wins | `s` server wins |
+| --- | --- | --- |
+| version differs | upload your version to the server | install the server's version here |
+| not on server | upload it | drop it locally |
+| only on server | delete it from the server (asks again) | add it to your local list |
+
+A capital `L` or `S` answers the same way for everything left. For scripts,
+`--to-server` or `--from-server` skips the questions (`--yes` requires one of
+them). Uploads replace the mod's whole folder using the same layout a local
+install produces, and `-n` shows what would happen. "Server wins" goes through
+the local overlay, so `publish` is how you then share it with the group. The
+game server needs a restart to load anything you uploaded.
 
 ## What preflight actually checks
 
@@ -84,6 +167,8 @@ always win.
 | Shared config | `config.conf` in this repo |
 | Local overrides | `~/.config/valheim-sync/local.conf` |
 | State | `~/Library/Application Support/valheim-sync` |
+| Server login | `~/.config/valheim-sync/server.conf` (+ Keychain) |
+| Local overlay | `<state>/overlay.tsv`, `<state>/dropped.txt` |
 | Download cache | `~/Library/Caches/valheim-sync` |
 | BepInEx log | `<game>/BepInEx/LogOutput.log` |
 | Preloader crash log | `<game>/valheim.app/Contents/MacOS/preloader_*.log` |
